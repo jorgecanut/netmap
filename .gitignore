@@ -1,0 +1,7 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# NetMap runtime state (generated at run time — do not commit)
+netmap_geo_cache.json
