@@ -12,8 +12,9 @@ the remote servers, and plots them on a live, dark-themed world map with animate
 arcs from your location to each destination. Hover any point to see the process,
 port, city, and ISP behind it.
 
-A single Python file, no packages required. `psutil` is optional and just adds
-per-process names and throughput.
+A single Python file, no packages required, on every supported OS. `psutil` is
+optional — if it happens to be installed NetMap uses it, since it is faster and
+reports throughput, but nothing depends on it.
 
 > **Want your whole network** — phones, TVs, IoT, every device — instead of just
 > one computer? See the sibling project **[NetWatch](../../netwatch)**, which does
@@ -45,15 +46,23 @@ to your network — it binds to `127.0.0.1` only.
 - Live map of every outbound connection from your machine, updated every ~2s
 - Your own location shown as a pulsing home marker, with animated arcs to each host
 - Markers sized by connection count; hover for process, port, city, and ISP
-- Filterable side panel and live stats (active connections, hosts, countries, ↑/↓ rate)
+- **Threat-intelligence flagging** against Tor exit nodes, FireHOL level-1 and
+  Spamhaus DROP (auto-refreshed, disk-cached): blocklisted destinations turn red,
+  sort to the top of the list, and the tooltip names *which* list matched
+- Filterable side panel and live stats (active connections, hosts, flagged,
+  countries, ↑/↓ rate)
 - Graceful fallbacks when the map tiles or geolocation service are blocked
 - Geolocation results cached locally so restarts light up instantly
 
 ## Requirements
 
-- Python 3.7+
-- Optional: `pip install psutil` (adds process names and throughput; without it,
-  NetMap falls back to `netstat` on Windows)
+- Python 3.7+ — and nothing else
+- Optional: `psutil`. Used automatically when present (faster, adds throughput).
+  Without it NetMap reads the socket table directly: `/proc/net` on Linux,
+  `netstat -ano` + `tasklist` on Windows, `lsof` on macOS.
+
+Sockets owned by *other* users are only attributable when running elevated; your
+own processes always resolve.
 
 ## Quick start
 
@@ -84,10 +93,13 @@ data that leaves your machine is the set of remote IP addresses sent to the free
 
 ## How it works
 
-NetMap reads your machine's connection table (via `psutil`, or `netstat` as a
-fallback), keeps only connections to public IPs, geolocates them in batches, and
+NetMap reads your machine's connection table (via `psutil` when available,
+otherwise the platform's own socket table), keeps only connections to public IPs,
+geolocates them in batches, checks each against public reputation blocklists, and
 serves a single self-contained HTML page that renders the map with
 [Leaflet](https://leafletjs.com/) and polls a small JSON endpoint.
+
+The page is served on `127.0.0.1` only — it is not reachable from your network.
 
 ## License
 

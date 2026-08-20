@@ -12,9 +12,11 @@ Options:
     --home LAT,LON   set your own map location manually   (skips self-geolocation)
 
 Notes:
-  * Works best with psutil installed:   pip install psutil
-    (adds per-process names; without it, NetMap falls back to parsing
-    `netstat -ano` + `tasklist` on Windows).
+  * No installs required. NetMap reads the socket table with the standard
+    library on every supported OS — /proc on Linux, `netstat -ano` +
+    `tasklist` on Windows, `lsof` on macOS. If psutil happens to be present
+    it is used instead, since it is faster and reports connection state
+    for every process; but it is a bonus, not a requirement.
   * Remote IPs are geolocated server-side via the free ip-api.com service
     (plain HTTP, ~city-level accuracy). Results are cached next to this
     script in netmap_geo_cache.json so repeat lookups are instant.
@@ -46,6 +48,9 @@ except ImportError:
 # Configuration / shared state
 # ----------------------------------------------------------------------------
 
+VERSION = "2026.08.20.1"   # date + same-day build number, matching NetWatch, so
+                           # the running build can be identified from the header
+                           # and the startup log rather than guessed at
 DEFAULT_PORT = 8339
 GEO_BATCH_URL = ("http://ip-api.com/batch?fields=status,message,country,"
                  "countryCode,regionName,city,lat,lon,isp,org,query")
@@ -74,6 +79,186 @@ EXTRA_GEO_IPS = set()  # public endpoint IPs (e.g. tailnet direct peers) to geol
 TS_RANGES = [ipaddress.ip_network("100.64.0.0/10"),
              ipaddress.ip_network("fd7a:115c:a1e0::/48")]
 TS_POLL = 10          # seconds between `tailscale status` polls
+
+# ----------------------------------------------------------------------------
+# Threat intelligence (public blocklists -> flag remote IPs)
+# ----------------------------------------------------------------------------
+# Ported from NetWatch. NetMap previously showed you every destination with no
+# verdict on whether any of them were dangerous, which was its biggest gap: a
+# map of where your traffic goes is much more useful when the bad dots are red.
+
+THREAT_CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "netmap_threat_cache.json")
+THREAT_REFRESH = 6 * 3600
+THREAT_CACHE_MAX = 50000     # cap the match memo (bounds long-run memory)
+THREAT_LOCK = threading.RLock()
+THREAT = {"exact": {}, "nets": [], "loaded": 0, "ts": 0, "error": None, "gen": 0}
+
+THREAT_SOURCES = {
+    "tor": "https://check.torproject.org/torbulkexitlist",
+    "firehol": "https://raw.githubusercontent.com/firehol/blocklist-ipsets/"
+               "master/firehol_level1.netset",
+    "spamhaus": "https://www.spamhaus.org/drop/drop.txt",
+}
+# Human-readable name per source, plus what a hit on it actually means. Shown in
+# the detail drawer so "flagged" is an explanation rather than a red dot.
+THREAT_LABELS = {
+    "tor": "Tor exit node",
+    "firehol": "FireHOL level 1",
+    "spamhaus": "Spamhaus DROP",
+    "blocklist": "Public blocklist",
+}
+THREAT_MEANING = {
+    "tor": "The far end is a Tor exit relay. Traffic to it is anonymised — normal "
+           "for a Tor user on your LAN, suspicious for an IoT device or a TV.",
+    "firehol": "Aggregated list of IPs that should never appear in normal traffic: "
+               "bogons, hijacked ranges, and known attack infrastructure.",
+    "spamhaus": "Spamhaus DROP — netblocks leased or hijacked wholesale by "
+                "criminal operations. No legitimate traffic should go here.",
+    "blocklist": "Matched a public reputation blocklist.",
+}
+
+
+def _parse_netset(text, source="blocklist"):
+    """Parse a plain-text IP/CIDR blocklist. Returns (exact, nets) where exact is
+    {ip: source} and nets is [(network, source)] — the source tag is what lets the
+    UI say "Tor exit node" instead of a bare red dot."""
+    exact, nets = {}, []
+    for line in text.splitlines():
+        line = line.split("#")[0].split(";")[0].strip()
+        if not line:
+            continue
+        token = line.split()[0]
+        try:
+            if "/" in token:
+                nets.append((ipaddress.ip_network(token, strict=False), source))
+            else:
+                ipaddress.ip_address(token)
+                exact[token] = source
+        except ValueError:
+            continue
+    return exact, nets
+
+
+def _http_text(url, timeout=25):
+    req = urllib.request.Request(url, headers={"User-Agent": "netwatch/2.0"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read().decode("utf-8", "ignore")
+
+
+def _threat_install(exact, nets, ts):
+    """Swap in a new blocklist set and bump the generation counter so every
+    memoised verdict from the previous generation is discarded."""
+    with THREAT_LOCK:
+        THREAT["exact"] = exact
+        THREAT["nets"] = nets
+        THREAT["loaded"] = len(exact) + len(nets)
+        THREAT["ts"] = ts
+        THREAT["gen"] += 1
+
+
+def threat_worker():
+    # Try disk cache first for an instant start.
+    try:
+        with open(THREAT_CACHE, "r", encoding="utf-8") as f:
+            c = json.load(f)
+        cached_exact = c.get("exact", {})
+        if isinstance(cached_exact, list):     # pre-attribution cache format
+            cached_exact = {ip: "blocklist" for ip in cached_exact}
+        cached_nets = []
+        for item in c.get("nets", []):
+            # new format: ["1.2.3.0/24", "spamhaus"]; old format: "1.2.3.0/24"
+            net, src = item if isinstance(item, (list, tuple)) else (item, "blocklist")
+            cached_nets.append((ipaddress.ip_network(net), src))
+        _threat_install(cached_exact, cached_nets, c.get("ts", 0))
+    except Exception:
+        pass
+    while True:
+        exact, nets, srcs_ok = {}, [], 0
+        for name, url in THREAT_SOURCES.items():
+            try:
+                e, nn = _parse_netset(_http_text(url), name)
+                for ip, src in e.items():
+                    prev = exact.get(ip)
+                    # an IP on several lists keeps all of them, comma-joined
+                    exact[ip] = src if not prev else prev + "," + src
+                nets += nn
+                srcs_ok += 1
+            except Exception:
+                pass
+        if srcs_ok:
+            _threat_install(exact, nets, time.time())
+            with THREAT_LOCK:
+                THREAT["error"] = None
+            try:
+                with open(THREAT_CACHE, "w", encoding="utf-8") as f:
+                    json.dump({"exact": exact,
+                               "nets": [[str(n), s] for n, s in nets],
+                               "ts": THREAT["ts"]}, f)
+            except Exception:
+                pass
+        else:
+            with THREAT_LOCK:
+                THREAT["error"] = "could not fetch blocklists"
+        time.sleep(THREAT_REFRESH)
+
+
+_threat_verdict = {}      # ip -> comma-joined source keys, or "" (memoised)
+_threat_verdict_gen = -1  # generation the memo cache above was built against
+
+
+def threat_match(ip):
+    """Comma-joined blocklist source keys for `ip` (e.g. "tor" or
+    "firehol,spamhaus"), or None if it isn't listed. Truthy on a hit, so callers
+    that only test for listedness keep working."""
+    global _threat_verdict_gen
+    with THREAT_LOCK:
+        gen = THREAT["gen"]
+        exact = THREAT["exact"]
+        nets = THREAT["nets"]
+        loaded = THREAT["loaded"]
+    # The lists load asynchronously at startup. Without this guard the first few
+    # seconds of traffic get memoised as "clean" against an EMPTY blocklist and are
+    # never re-checked — a silent false negative on every single restart. Verdicts
+    # are therefore tied to a generation, and nothing is cached before a list exists.
+    if gen != _threat_verdict_gen:
+        _threat_verdict.clear()
+        _threat_verdict_gen = gen
+    if not loaded:
+        return None
+    v = _threat_verdict.get(ip)
+    if v is not None:
+        return v or None
+    hits = []
+    src = exact.get(ip)
+    if src:
+        hits.append(src)
+    try:
+        a = ipaddress.ip_address(ip)
+        for net, nsrc in nets:
+            if a in net and nsrc not in hits:
+                hits.append(nsrc)
+    except ValueError:
+        pass
+    hit = ",".join(sorted(set(",".join(hits).split(","))) if hits else [])
+    # Bound the cache: on an always-on service the set of distinct remote IPs
+    # grows forever, so clear (and re-memoize on demand) once it gets large.
+    if len(_threat_verdict) >= THREAT_CACHE_MAX:
+        _threat_verdict.clear()
+    _threat_verdict[ip] = hit
+    return hit or None
+
+
+def threat_sources(ip):
+    """[{key,label,meaning}] for each blocklist `ip` appears on (empty if clean)."""
+    hit = threat_match(ip) or ""
+    out = []
+    for key in [k for k in hit.split(",") if k]:
+        out.append({"key": key,
+                    "label": THREAT_LABELS.get(key, key),
+                    "meaning": THREAT_MEANING.get(key, "")})
+    return out
+
 
 # ----------------------------------------------------------------------------
 # Connection collection
@@ -168,13 +353,143 @@ def collect_netstat_windows():
     return rows
 
 
+# --- stdlib collectors -------------------------------------------------------
+# psutil is nicer when it is there, but requiring it contradicts the project's
+# own rule (no pip installs) and left Linux and macOS with no fallback at all.
+# These read the same socket table the OS shows netstat.
+
+_TCP_STATES = {"01": "ESTABLISHED", "02": "SYN_SENT", "03": "SYN_RECV",
+               "04": "FIN_WAIT1", "05": "FIN_WAIT2", "06": "TIME_WAIT",
+               "07": "CLOSE", "08": "CLOSE_WAIT", "09": "LAST_ACK",
+               "0A": "LISTEN", "0B": "CLOSING"}
+
+
+def _hex_to_ip(h):
+    """/proc/net stores addresses as little-endian hex words."""
+    if len(h) == 8:
+        b = bytes.fromhex(h)
+        return "%d.%d.%d.%d" % (b[3], b[2], b[1], b[0])
+    if len(h) == 32:
+        raw = b"".join(bytes.fromhex(h[i:i + 8])[::-1] for i in range(0, 32, 8))
+        return socket.inet_ntop(socket.AF_INET6, raw)
+    return ""
+
+
+def _linux_inode_map():
+    """socket inode -> (process name, pid), for processes we may read.
+    Sockets owned by other users need root; ours always resolve."""
+    m = {}
+    try:
+        pids = [p for p in os.listdir("/proc") if p.isdigit()]
+    except OSError:
+        return m
+    for pid in pids:
+        fd_dir = "/proc/%s/fd" % pid
+        try:
+            fds = os.listdir(fd_dir)
+        except OSError:
+            continue                      # not ours, or already exited
+        name = None
+        for fd in fds:
+            try:
+                target = os.readlink(os.path.join(fd_dir, fd))
+            except OSError:
+                continue
+            if not target.startswith("socket:["):
+                continue
+            if name is None:
+                try:
+                    with open("/proc/%s/comm" % pid) as fh:
+                        name = fh.read().strip()
+                except OSError:
+                    name = "pid %s" % pid
+            m[target[8:-1]] = (name, int(pid))
+    return m
+
+
+def collect_linux():
+    inodes = _linux_inode_map()
+    rows = []
+    for fam in ("tcp", "tcp6", "udp", "udp6"):
+        try:
+            with open("/proc/net/" + fam) as fh:
+                next(fh, None)                     # header
+                lines = fh.readlines()
+        except (OSError, StopIteration):
+            continue
+        udp = fam.startswith("udp")
+        for line in lines:
+            f = line.split()
+            if len(f) < 10 or ":" not in f[2]:
+                continue
+            ip_h, port_h = f[2].rsplit(":", 1)
+            try:
+                port = int(port_h, 16)
+            except ValueError:
+                continue
+            ip = _hex_to_ip(ip_h)
+            if not port or not ip:
+                continue
+            proc, pid = inodes.get(f[9], (None, None))
+            rows.append({
+                "ip": ip, "port": port,
+                "proto": "udp" if udp else "tcp",
+                "status": "UDP" if udp else _TCP_STATES.get(f[3].upper(), f[3]),
+                "pid": pid,
+                "proc": proc or ("pid %s" % pid if pid else "unknown"),
+            })
+    return rows
+
+
+def collect_lsof_macos():
+    try:
+        out = subprocess.run(["lsof", "-i", "-nP"], capture_output=True,
+                             text=True, timeout=25).stdout
+    except Exception as e:
+        raise RuntimeError("lsof failed: %s" % e)
+    rows = []
+    for line in out.splitlines()[1:]:
+        f = line.split()
+        if len(f) < 9 or "->" not in f[8]:
+            continue
+        remote = f[8].split("->")[1]
+        m = re.match(r"^\[?([0-9a-fA-F:.%]+?)\]?:(\d+)$", remote)
+        if not m:
+            continue
+        try:
+            pid = int(f[1])
+        except ValueError:
+            pid = None
+        rows.append({
+            "ip": m.group(1).split("%")[0], "port": int(m.group(2)),
+            "proto": "udp" if f[7].upper() == "UDP" else "tcp",
+            "status": (f[9].strip("()").upper() if len(f) > 9 else "ESTABLISHED"),
+            "pid": pid, "proc": f[0],
+        })
+    return rows
+
+
+def _collector_name():
+    if os.name == "nt":
+        return "netstat + tasklist"
+    if sys.platform.startswith("linux"):
+        return "/proc/net"
+    if sys.platform == "darwin":
+        return "lsof"
+    return "unsupported"
+
+
 def collect_connections():
     if psutil is not None:
         return collect_psutil()
     if os.name == "nt":
         return collect_netstat_windows()
-    raise RuntimeError("psutil is not installed and no netstat fallback is "
-                       "available on this OS. Run: pip install psutil")
+    if sys.platform.startswith("linux"):
+        return collect_linux()
+    if sys.platform == "darwin":
+        return collect_lsof_macos()
+    raise RuntimeError("no way to read the socket table on this platform (%s); "
+                       "installing psutil would add one" % sys.platform)
 
 
 def is_public(ip):
@@ -468,7 +783,15 @@ def snapshot():
         h["last_seen"] = max(h["last_seen"], c["last_seen"])
     out_hosts = []
     countries = set()
+    flagged = 0
     for h in hosts.values():
+        # threat_match memoises and takes its own lock; NetMap's LOCK is already
+        # released here, which is what we want — it scans thousands of CIDRs.
+        h["threat"] = threat_match(h["ip"]) or ""
+        h["threat_labels"] = [THREAT_LABELS.get(k, k)
+                              for k in h["threat"].split(",") if k]
+        if h["threat"]:
+            flagged += 1
         g = geo.get(h["ip"])
         if g and g.get("status") == "ok":
             h["geo"] = {k: g[k] for k in ("lat", "lon", "city", "region",
@@ -481,7 +804,10 @@ def snapshot():
         h["conns"].sort(key=lambda c: (-c["active"], c["proc"], c["port"]))
         del h["first_seen"], h["last_seen"]
         out_hosts.append(h)
-    out_hosts.sort(key=lambda h: (-h["active"], h["age"], h["ip"]))
+    # flagged first: if anything on this machine is talking to a blocklisted
+    # address, that is the one row you need to see without scrolling.
+    out_hosts.sort(key=lambda h: (-bool(h["threat"]), -h["active"], h["age"],
+                                  h["ip"]))
 
     with LOCK:
         ts = {"available": TAILNET["available"], "error": TAILNET["error"],
@@ -498,15 +824,22 @@ def snapshot():
         if p.get("online") and p.get("active"):
             ts_active += 1
 
+    with THREAT_LOCK:
+        threat_stat = {"loaded": THREAT["loaded"], "ts": THREAT["ts"],
+                       "error": THREAT["error"]}
     return {
+        "version": VERSION,
         "home": HOME,
         "geo_state": GEO_STATE,
         "scan_error": SCAN_ERROR,
         "psutil": psutil is not None,
+        "collector": "psutil" if psutil is not None else _collector_name(),
+        "threat": threat_stat,
         "tailnet": ts,
         "stats": {
             "active": sum(1 for c in conns if now - c["last_seen"] <= STALE_AFTER),
             "hosts": len(out_hosts),
+            "flagged": flagged,
             "countries": len(countries),
             "down_bps": round(RATES["down_bps"]),
             "up_bps": round(RATES["up_bps"]),
@@ -569,12 +902,15 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <style>
   :root{
     color-scheme: dark;
-    --surface-1:#141413; --surface-2:#1e1e1c; --surface-3:#2a2a27;
-    --border:#3a3a36;
-    --text-primary:#ffffff; --text-secondary:#c3c2b7; --text-muted:#8a897f;
+    /* Dark grey, shared with NetWatch so the two read as one family. */
+    --surface-1:#212429; --surface-2:#282c32; --surface-3:#343941;
+    --border:#454b55; --border-soft:#333840;
+    --text-primary:#ffffff; --text-secondary:#c7cbd2; --text-muted:#8c919b;
     --series-1:#3987e5;         /* connection arcs & markers   */
+    --accent:#3987e5; --accent-2:#9085e9;
     --accent-home:#199e70;      /* home marker                 */
     --status-good:#0ca30c; --status-warning:#fab219; --status-critical:#d03b3b;
+    --bad:#d03b3b;
   }
   *{box-sizing:border-box}
   html,body{margin:0;height:100%;background:var(--surface-1);
@@ -582,23 +918,41 @@ HTML_PAGE = r"""<!DOCTYPE html>
     color:var(--text-primary);overflow:hidden}
   #app{display:grid;grid-template-rows:auto 1fr;height:100%}
 
-  header{display:flex;align-items:center;gap:16px;padding:10px 16px;
-    background:var(--surface-2);border-bottom:1px solid var(--border);
-    flex-wrap:wrap}
-  h1{font-size:15px;margin:0;font-weight:600;letter-spacing:.02em}
-  h1 span{color:var(--series-1)}
-  .pill{display:inline-flex;align-items:center;gap:6px;padding:2px 10px;
-    border-radius:999px;background:var(--surface-3);color:var(--text-secondary);
-    font-size:11px}
-  .pill .led{width:7px;height:7px;border-radius:50%;background:var(--status-good)}
-  .pill.warn .led{background:var(--status-warning)}
-  .pill.bad  .led{background:var(--status-critical)}
-  .tiles{display:flex;gap:10px;margin-left:auto;flex-wrap:wrap}
-  .tile{background:var(--surface-3);border-radius:8px;padding:5px 12px;
-    text-align:right;min-width:86px}
-  .tile b{display:block;font-size:16px;font-variant-numeric:tabular-nums}
-  .tile small{color:var(--text-muted);font-size:10px;text-transform:uppercase;
-    letter-spacing:.06em}
+  header{display:flex;align-items:center;gap:14px;padding:10px 16px;position:relative;
+    background:linear-gradient(180deg,#2e333a,#242830);
+    border-bottom:1px solid var(--border);flex-wrap:wrap;
+    box-shadow:0 1px 0 rgba(255,255,255,.03),0 4px 18px rgba(0,0,0,.35)}
+  header::after{content:"";position:absolute;left:0;right:0;bottom:-1px;height:1px;
+    background:linear-gradient(90deg,var(--accent),var(--accent-2),transparent 65%);opacity:.55}
+  .brand{display:flex;flex-direction:column}
+  .brow{display:flex;align-items:center;gap:9px}
+  h1{margin:0;line-height:0}
+  .logo{height:38px;width:auto;display:block;overflow:visible}
+  .logo .lblip{animation:nmblip 2.8s ease-in-out infinite}
+  @keyframes nmblip{0%,70%,100%{opacity:1}82%{opacity:.3}}
+  .tag{display:block;font-size:9px;color:var(--text-muted);letter-spacing:.1em;
+    text-transform:uppercase;margin-top:-1px;white-space:nowrap}
+  #ver{color:var(--text-muted);font-size:11px;font-family:Consolas,ui-monospace,monospace}
+  .pill{display:inline-flex;align-items:center;gap:6px;padding:3px 11px;
+    border-radius:999px;background:var(--surface-3);border:1px solid var(--border);
+    color:var(--text-secondary);font-size:11px}
+  .pill .led{width:7px;height:7px;border-radius:50%;background:var(--status-good);
+    box-shadow:0 0 7px currentColor;color:var(--status-good)}
+  .pill.warn .led{background:var(--status-warning);color:var(--status-warning)}
+  .pill.bad  .led{background:var(--status-critical);color:var(--status-critical)}
+  .tiles{display:flex;gap:8px;margin-left:auto;flex-wrap:wrap;align-items:stretch}
+  .tile{position:relative;background:linear-gradient(180deg,#383d46,#2c3038);
+    border:1px solid var(--border);border-radius:10px;padding:6px 13px 6px 14px;
+    text-align:right;min-width:86px;overflow:hidden;transition:all .16s}
+  .tile::before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px;
+    background:var(--accent);opacity:.55}
+  .tile.flagged::before{background:var(--bad)}
+  .tile.flagged.hot{border-color:rgba(208,59,59,.55);
+    background:linear-gradient(180deg,#40282b,#312024)}
+  .tile.flagged.hot b{color:#ff8f8f}
+  .tile b{display:block;font-size:17px;font-variant-numeric:tabular-nums;line-height:1.15}
+  .tile small{color:var(--text-muted);font-size:9.5px;text-transform:uppercase;
+    letter-spacing:.07em}
   #quitBtn{align-self:center;background:var(--surface-3);color:var(--text-secondary);
     border:1px solid var(--border);border-radius:8px;padding:6px 12px;font:inherit;
     font-size:11px;cursor:pointer}
@@ -629,6 +983,14 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .host .loc{color:var(--text-secondary);font-size:12px;margin-top:1px}
   .host .ipline{color:var(--text-muted);font-size:11px;
     font-family:Consolas,ui-monospace,monospace;margin-top:1px}
+  .host.flag{border-left:3px solid var(--bad);
+    background:linear-gradient(90deg,rgba(208,59,59,.12),transparent 60%)}
+  .threatline{margin-bottom:3px}
+  .badge-threat{font-size:9px;padding:1px 6px;border-radius:4px;font-weight:600;
+    text-transform:uppercase;letter-spacing:.03em;background:#4a2020;color:#ff9b9b}
+  .nm-dot.bad .core{background:var(--bad)}
+  .nm-dot.bad .ring{border-color:var(--bad)}
+  .tt-threat{color:#ff9b9b;font-weight:600}
   .empty{padding:24px 16px;color:var(--text-muted);text-align:center}
   .section-hd{display:flex;align-items:center;gap:8px;padding:9px 12px 5px;
     font-size:10px;text-transform:uppercase;letter-spacing:.08em;
@@ -689,12 +1051,35 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <body>
 <div id="app">
   <header>
-    <h1>Net<span>Map</span></h1>
+    <div class="brand">
+      <div class="brow">
+        <h1><svg class="logo" viewBox="0 0 140 44" role="img" aria-label="NetMap">
+          <defs><linearGradient id="nmGrad" x1="0" y1="0" x2="1" y2="0">
+            <stop offset="0" stop-color="#5aa0f0"/><stop offset="1" stop-color="#9085e9"/>
+          </linearGradient></defs>
+          <text x="1" y="27" textLength="104" lengthAdjust="spacingAndGlyphs"
+            font-size="23" font-weight="700" letter-spacing=".2"
+            font-family="Segoe UI,system-ui,-apple-system,sans-serif"
+            fill="var(--text-primary)">Net<tspan fill="url(#nmGrad)">Map</tspan></text>
+          <path d="M1 36 H106 C114 36 116 33 119 28 L124 18" fill="none"
+            stroke="url(#nmGrad)" stroke-width="2" stroke-linecap="round"
+            stroke-opacity=".9"/>
+          <circle cx="28" cy="36" r="2.7" fill="url(#nmGrad)"/>
+          <circle cx="70" cy="36" r="2.7" fill="url(#nmGrad)"/>
+          <circle class="lblip" cx="125.5" cy="14.5" r="4.2" fill="#e2564f"/>
+        </svg></h1>
+      </div>
+      <small class="tag">This machine. Every connection. One map.</small>
+    </div>
+    <span id="ver" title="running build">v–</span>
     <span class="pill" id="geoPill"><span class="led"></span><span id="geoTxt">geo: waiting</span></span>
+    <span class="pill" id="threatPill" style="display:none"><span class="led"></span><span id="threatTxt">threat</span></span>
     <span class="pill" id="tsPill" style="display:none"><span class="led"></span><span id="tsTxt">tailscale</span></span>
     <div class="tiles">
       <div class="tile"><b id="tActive">–</b><small>active conns</small></div>
       <div class="tile"><b id="tHosts">–</b><small>remote hosts</small></div>
+      <div class="tile flagged" id="tileFlagged"
+        title="Remote hosts on a public threat blocklist"><b id="tFlagged">–</b><small>flagged</small></div>
       <div class="tile"><b id="tCountries">–</b><small>countries</small></div>
       <div class="tile"><b id="tRate">–</b><small>&#8595; / &#8593; rate</small></div>
       <button id="quitBtn" title="Stop NetMap">&#10005; quit</button>
@@ -815,7 +1200,9 @@ function tooltipHTML(h){
     esc(c.proc) + " &rarr; :" + c.port + " " + c.proto.toUpperCase()
     + (c.active ? "" : " (closed)")).join("<br>");
   const more = h.conns.length > 8 ? "<br>&hellip; +" + (h.conns.length-8) + " more" : "";
-  return '<div class="tt-loc">' + flag(g.countryCode) + " "
+  return ((h.threat_labels && h.threat_labels.length)
+      ? '<div class="tt-threat">&#9888; ' + esc(h.threat_labels.join(", ")) + "</div>" : "")
+    + '<div class="tt-loc">' + flag(g.countryCode) + " "
     + esc(g.city ? g.city + ", " : "") + esc(g.country || "Unknown location") + "</div>"
     + '<div class="tt-ip">' + esc(h.ip) + "</div>"
     + (g.isp ? '<div class="tt-isp">' + esc(g.isp) + "</div>" : "")
@@ -839,6 +1226,22 @@ function render(d){
   document.getElementById("tActive").textContent = d.stats.active;
   document.getElementById("tHosts").textContent = d.stats.hosts;
   document.getElementById("tCountries").textContent = d.stats.countries;
+  if(d.version) document.getElementById("ver").textContent = "v" + d.version;
+  const nFlag = d.stats.flagged || 0;
+  document.getElementById("tFlagged").textContent = nFlag;
+  document.getElementById("tileFlagged").classList.toggle("hot", !!nFlag);
+  // threat pill: says whether the blocklists actually loaded, so an empty
+  // "flagged" count can be read as "nothing bad" rather than "not checked"
+  const th = d.threat || {}, thp = document.getElementById("threatPill"),
+        tht = document.getElementById("threatTxt");
+  if(th.loaded){
+    thp.style.display = ""; thp.className = "pill" + (nFlag ? " bad" : "");
+    tht.textContent = "threat lists: " + th.loaded.toLocaleString() + " entries"
+      + (nFlag ? " \u00b7 " + nFlag + " hit" + (nFlag===1?"":"s") : "");
+  } else if(th.error){
+    thp.style.display = ""; thp.className = "pill warn";
+    tht.textContent = "threat: " + th.error;
+  } else { thp.style.display = "none"; }
   document.getElementById("tRate").textContent =
     d.psutil ? fmtRate(d.stats.down_bps) + " / " + fmtRate(d.stats.up_bps) : "n/a";
 
@@ -874,36 +1277,44 @@ function render(d){
     seen.add(h.ip);
     const ll = [h.geo.lat, h.geo.lon];
     const size = Math.min(10 + h.count * 2, 22);
+    // A blocklisted destination is drawn red and lifted above its neighbours —
+    // it is the one dot on the map that should catch your eye first.
+    const bad = !!h.threat;
+    const cls = (h.active ? "active" : "") + (bad ? " bad" : "");
+    const arcCol = bad ? "#d03b3b" : BLUE;
+    const arcOp = bad ? .85 : (h.active ? .6 : .18);
     let entry = layers.get(h.ip);
     if(!entry){
-      const marker = L.marker(ll, {icon: dotIcon(h.active ? "active" : "", size)})
+      const marker = L.marker(ll, {icon: dotIcon(cls, size),
+          zIndexOffset: bad ? 800 : 0})
         .addTo(map)
         .bindTooltip(tooltipHTML(h),
           {className:"nm", direction:"top", offset:[0,-8], sticky:true});
       let arc = null;
       if(homeLL){
         arc = L.polyline(arcPoints(homeLL, ll), {
-          color: BLUE, weight: 1.5, opacity: h.active ? .6 : .18,
+          color: arcCol, weight: bad ? 2.2 : 1.5, opacity: arcOp,
           className: h.active ? "nm-arc" : "", interactive: false
         }).addTo(map);
       }
-      entry = {marker, arc, active: h.active, size};
+      entry = {marker, arc, active: h.active, size, bad};
       layers.set(h.ip, entry);
     } else {
-      if(entry.active !== h.active || entry.size !== size){
-        entry.marker.setIcon(dotIcon(h.active ? "active" : "", size));
-        if(entry.arc) entry.arc.setStyle({opacity: h.active ? .6 : .18,
-          className: h.active ? "nm-arc" : ""});
-        entry.active = h.active; entry.size = size;
+      if(entry.active !== h.active || entry.size !== size || entry.bad !== bad){
+        entry.marker.setIcon(dotIcon(cls, size));
+        entry.marker.setZIndexOffset(bad ? 800 : 0);
+        if(entry.arc) entry.arc.setStyle({color: arcCol, weight: bad ? 2.2 : 1.5,
+          opacity: arcOp, className: h.active ? "nm-arc" : ""});
+        entry.active = h.active; entry.size = size; entry.bad = bad;
       }
       if(entry.arc === null && homeLL){
         entry.arc = L.polyline(arcPoints(homeLL, ll), {
-          color: BLUE, weight: 1.5, opacity: .6,
+          color: arcCol, weight: bad ? 2.2 : 1.5, opacity: arcOp,
           className: "nm-arc", interactive: false}).addTo(map);
       }
       entry.marker.setTooltipContent(tooltipHTML(h));
     }
-    entry.marker.setOpacity(h.active ? 1 : .35);
+    entry.marker.setOpacity((h.active || bad) ? 1 : .35);
   }
   for(const [ip, entry] of layers){
     if(!seen.has(ip)){
@@ -979,12 +1390,18 @@ function renderList(){
   for(const h of latest.hosts){
     const g = h.geo || {};
     const procs = [...new Set(h.conns.map(c => c.proc))];
+    const labels = (h.threat_labels || []).join(" ");
     const hay = (h.ip + " " + procs.join(" ") + " " + (g.country||"")
-      + " " + (g.city||"")).toLowerCase();
+      + " " + (g.city||"") + " " + labels
+      + (h.threat ? " flagged threat" : "")).toLowerCase();
     if(q && !hay.includes(q)) continue;
     const ports = [...new Set(h.conns.map(c => ":" + c.port))].slice(0,6).join(" ");
+    const tb = h.threat
+      ? '<span class="badge-threat">&#9888; ' + esc(labels || "flagged") + "</span>" : "";
     rows.push('<div class="host' + (h.active ? "" : " inactive")
+      + (h.threat ? " flag" : "")
       + '" data-ip="' + esc(h.ip) + '">'
+      + (tb ? '<div class="threatline">' + tb + "</div>" : "")
       + '<div class="top"><div class="procs">' + esc(procs.join(", "))
       + '</div><div class="cnt">' + h.count + (h.count>1?" conns":" conn") + "</div></div>"
       + '<div class="loc">' + flag(g.countryCode) + " "
@@ -1094,14 +1511,17 @@ def main():
         except ValueError:
             sys.exit("--home must look like 39.74,-104.99")
 
-    print("NetMap starting...")
+    print("NetMap v%s starting..." % VERSION)
     if psutil is None:
-        print("  psutil not installed - using netstat fallback "
-              "(pip install psutil for process detail)")
+        print("  reading sockets with the standard library (%s); psutil is "
+              "optional and not installed" % _collector_name())
+    else:
+        print("  reading sockets via psutil")
     _load_cache()
 
     threading.Thread(target=poller, daemon=True).start()
     threading.Thread(target=geo_worker, daemon=True).start()
+    threading.Thread(target=threat_worker, daemon=True).start()
     threading.Thread(target=tailnet_worker, daemon=True).start()
 
     url = "http://localhost:%d" % args.port
