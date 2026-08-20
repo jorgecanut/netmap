@@ -29,10 +29,9 @@ location to each remote host; the right panel lists every connection with its
 process, city, and ISP. NetMap shares its interface with its network-wide sibling
 **[NetWatch](../../netwatch)** — see the screenshots there for the look and feel.
 
-> Tip: run NetMap, take a screenshot, drop it in a `docs/` folder, and reference it
-> here (`![NetMap](docs/netmap.png)`) to give your repo a hero image.
 
----
+![NetMap live map](docs/netmap.png)
+
 
 ## Why a helper script instead of a plain web page?
 
