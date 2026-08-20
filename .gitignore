@@ -5,6 +5,8 @@ __pycache__/
 
 # NetMap runtime state (generated at run time — do not commit)
 netmap_geo_cache.json
+netmap_threat_cache.json
+netmap.log
 
 # git lock/tmp files the Cowork device bridge creates but cannot unlink
 _git_stale/

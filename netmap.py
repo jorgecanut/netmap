@@ -44,11 +44,49 @@ try:
 except ImportError:
     psutil = None
 
+# --- windowless launch (NetMap.bat uses pythonw) ------------------------------
+# pythonw.exe gives the process no console. print() then silently does nothing
+# (CPython no-ops when sys.stdout is None) and, far worse, an unhandled
+# exception in main or in any worker thread kills NetMap with NO window, NO
+# error and nothing listening on the port — indistinguishable from "it just
+# doesn't start". Route output and every traceback to netmap.log beside the
+# script so a silent failure always leaves evidence.
+_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "netmap.log")
+_WINDOWLESS = sys.stdout is None or sys.stderr is None
+if _WINDOWLESS:
+    try:
+        _log = open(_LOG_PATH, "a", encoding="utf-8", buffering=1)
+    except Exception:
+        _log = open(os.devnull, "w")
+    if sys.stdout is None:
+        sys.stdout = _log
+    if sys.stderr is None:
+        sys.stderr = _log
+
+
+def _log_crash(kind, exc_type, exc, tb):
+    import traceback
+    try:
+        sys.stderr.write("\n%s  %s in %s\n" % (
+            time.strftime("%Y-%m-%d %H:%M:%S"), exc_type.__name__, kind))
+        traceback.print_exception(exc_type, exc, tb, file=sys.stderr)
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+
+sys.excepthook = lambda t, v, tb: _log_crash("main thread", t, v, tb)
+if hasattr(threading, "excepthook"):        # 3.8+
+    threading.excepthook = lambda a: _log_crash(
+        "thread %s" % getattr(a.thread, "name", "?"),
+        a.exc_type, a.exc_value, a.exc_traceback)
+
+
 # ----------------------------------------------------------------------------
 # Configuration / shared state
 # ----------------------------------------------------------------------------
 
-VERSION = "2026.08.20.1"   # date + same-day build number, matching NetWatch, so
+VERSION = "2026.08.20.2"   # date + same-day build number, matching NetWatch, so
                            # the running build can be identified from the header
                            # and the startup log rather than guessed at
 DEFAULT_PORT = 8339
@@ -1527,10 +1565,15 @@ def main():
     url = "http://localhost:%d" % args.port
     try:
         server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
-    except OSError:
-        # Port already taken -> NetMap is probably already running.
-        # Just open (or re-open) the existing map instead of erroring.
-        print("  NetMap already running - opening %s" % url)
+    except OSError as e:
+        # Port taken. Usually that means NetMap is already running, so re-open
+        # the existing map — but it can also be an unrelated program sitting on
+        # 8339, in which case opening the URL shows something that is not NetMap.
+        # Say which, rather than always claiming the cheerful explanation.
+        print("  cannot bind 127.0.0.1:%d (%s)" % (args.port, e))
+        print("  if NetMap is already running this is expected - opening %s" % url)
+        print("  if it is not, something else holds the port; try: "
+              "python netmap.py --port 8340")
         if not args.no_browser:
             webbrowser.open(url)
         return
