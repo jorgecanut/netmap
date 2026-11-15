@@ -51,6 +51,10 @@ to your network — it binds to `127.0.0.1` only.
   sort to the top of the list, and the tooltip names *which* list matched
 - Filterable side panel and live stats (active connections, hosts, flagged,
   countries, ↑/↓ rate)
+- **History tab**: every remote address seen, with process, ports, location and
+  first/last seen — capped at 2048 addresses (oldest dropped first, ~0.5 MB on
+  disk) and saved to `netmap_history.json` so it survives restarts
+- On Linux, also sees connections made inside Docker containers
 - Graceful fallbacks when the map tiles or geolocation service are blocked
 - Geolocation results cached locally so restarts light up instantly
 

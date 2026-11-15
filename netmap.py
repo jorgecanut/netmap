@@ -33,6 +33,7 @@ import json
 import os
 import re
 import secrets
+import signal
 import socket
 import subprocess
 import sys
@@ -92,7 +93,7 @@ if hasattr(threading, "excepthook"):        # 3.8+
 # Configuration / shared state
 # ----------------------------------------------------------------------------
 
-VERSION = "2026.11.15.1"   # date + same-day build number, matching NetWatch, so
+VERSION = "2026.11.15.3"   # date + same-day build number, matching NetWatch, so
                            # the running build can be identified from the header
                            # and the startup log rather than guessed at
 DEFAULT_PORT = 8339
@@ -106,6 +107,14 @@ STALE_AFTER = 8       # seconds without being seen -> connection shown as fading
 DROP_AFTER = 90       # seconds without being seen -> connection removed
 GEO_RETRY = 60        # seconds before retrying a failed geolocation
 CACHE_SAVE_EVERY = 30
+
+# Connection history: one entry per remote address, so repeat traffic updates
+# an entry instead of growing the file. Hard cap; the address idle the longest
+# is evicted first, which keeps the file (~0.5 MB at the cap) from growing.
+HISTORY_FILE = os.path.join(DATA_DIR, "netmap_history.json")
+HISTORY_MAX = 2048
+HISTORY_LIST_MAX = 8      # procs / ports remembered per address
+HISTORY = {}              # ip -> {ip, first_seen, last_seen, conns, procs, ports, geo}
 
 LOCK = threading.Lock()
 CONNS = {}            # key -> {ip, port, proto, status, pid, proc, first_seen, last_seen}
@@ -463,12 +472,46 @@ def _linux_inode_map():
     return m
 
 
+def _linux_netns_dirs():
+    """One /proc/<pid>/net directory per network namespace we can see.
+
+    /proc/net only lists sockets in NetMap's own namespace. Docker containers
+    (every TrueNAS app, for instance) each have their own, so their traffic was
+    invisible. With the host's PID namespace shared we can see their processes,
+    and /proc/<pid>/net shows the socket table of that process's namespace."""
+    dirs = ["/proc/net"]
+    try:
+        seen = {os.readlink("/proc/self/ns/net")}
+    except OSError:
+        return dirs                       # can't tell namespaces apart; own only
+    try:
+        pids = [p for p in os.listdir("/proc") if p.isdigit()]
+    except OSError:
+        return dirs
+    for pid in pids:
+        try:
+            ns = os.readlink("/proc/%s/ns/net" % pid)
+        except OSError:
+            continue                      # no permission, or already exited
+        if ns not in seen:
+            seen.add(ns)
+            dirs.append("/proc/%s/net" % pid)
+    return dirs
+
+
 def collect_linux():
     inodes = _linux_inode_map()
     rows = []
+    for netdir in _linux_netns_dirs():
+        rows.extend(_read_proc_net(netdir, inodes))
+    return rows
+
+
+def _read_proc_net(netdir, inodes):
+    rows = []
     for fam in ("tcp", "tcp6", "udp", "udp6"):
         try:
-            with open("/proc/net/" + fam) as fh:
+            with open(os.path.join(netdir, fam)) as fh:
                 next(fh, None)                     # header
                 lines = fh.readlines()
         except (OSError, StopIteration):
@@ -529,19 +572,21 @@ def _collector_name():
     if os.name == "nt":
         return "netstat + tasklist"
     if sys.platform.startswith("linux"):
-        return "/proc/net"
+        return "/proc/net (all network namespaces)"
     if sys.platform == "darwin":
         return "lsof"
     return "unsupported"
 
 
 def collect_connections():
+    # On Linux the /proc reader wins even when psutil is installed: psutil only
+    # sees NetMap's own network namespace, which hides every Docker container.
+    if sys.platform.startswith("linux"):
+        return collect_linux()
     if psutil is not None:
         return collect_psutil()
     if os.name == "nt":
         return collect_netstat_windows()
-    if sys.platform.startswith("linux"):
-        return collect_linux()
     if sys.platform == "darwin":
         return collect_lsof_macos()
     raise RuntimeError("no way to read the socket table on this platform (%s); "
@@ -562,6 +607,87 @@ def is_tailnet(ip):
     except ValueError:
         return False
     return any(a in net for net in TS_RANGES)
+
+
+def _remember(lst, item):
+    """Add item to a short most-recent-first list, capped at HISTORY_LIST_MAX."""
+    if item in lst:
+        lst.remove(item)
+    lst.insert(0, item)
+    del lst[HISTORY_LIST_MAX:]
+
+
+def _history_new_conn(r, now):
+    """Record a newly seen connection. Caller holds LOCK."""
+    h = HISTORY.get(r["ip"])
+    if h is None:
+        h = HISTORY[r["ip"]] = {"ip": r["ip"], "first_seen": now, "last_seen": now,
+                                "conns": 0, "procs": [], "ports": [], "geo": None}
+    h["last_seen"] = now
+    h["conns"] += 1
+    _remember(h["procs"], r["proc"])
+    _remember(h["ports"], "%s/%s" % (r["port"], r["proto"]))
+
+
+def _history_trim():
+    """Enforce HISTORY_MAX by evicting the longest-idle addresses. Caller holds LOCK."""
+    extra = len(HISTORY) - HISTORY_MAX
+    if extra > 0:
+        for ip in sorted(HISTORY, key=lambda k: HISTORY[k]["last_seen"])[:extra]:
+            del HISTORY[ip]
+
+
+def _load_history():
+    try:
+        with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        for h in data if isinstance(data, list) else []:
+            if isinstance(h, dict) and isinstance(h.get("ip"), str):
+                h.setdefault("procs", []); h.setdefault("ports", [])
+                h.setdefault("conns", 0); h.setdefault("geo", None)
+                h.setdefault("first_seen", h.get("last_seen", 0))
+                h.setdefault("last_seen", 0)
+                HISTORY[h["ip"]] = h
+        with LOCK:
+            _history_trim()
+        print("  loaded %d addresses of connection history" % len(HISTORY))
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        print("  could not read %s (%s); starting a new history"
+              % (HISTORY_FILE, e))
+
+
+def _history_snapshot():
+    """History newest-first, with location and threat verdict attached."""
+    with LOCK:
+        rows = [dict(h, procs=list(h["procs"]), ports=list(h["ports"]))
+                for h in HISTORY.values()]
+        geo = dict(GEO)
+    for h in rows:
+        g = geo.get(h["ip"])
+        if g and g.get("status") == "ok":
+            h["geo"] = {k: g.get(k, "") for k in ("city", "country",
+                                                   "countryCode", "isp")}
+        h["threat"] = threat_match(h["ip"]) or ""
+        h["threat_labels"] = [THREAT_LABELS.get(k, k)
+                              for k in h["threat"].split(",") if k]
+    rows.sort(key=lambda h: -h["last_seen"])
+    return rows
+
+
+def _save_history():
+    """Write atomically (temp file + rename) so a crash never leaves half a file."""
+    try:
+        rows = _history_snapshot()
+        for h in rows:
+            del h["threat"], h["threat_labels"]   # recomputed on load
+        tmp = HISTORY_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(rows, f)
+        os.replace(tmp, HISTORY_FILE)
+    except Exception:
+        pass
 
 
 def poller():
@@ -585,6 +711,7 @@ def poller():
                     r["first_seen"] = now
                     r["last_seen"] = now
                     CONNS[key] = r
+                    _history_new_conn(r, now)
                 else:
                     rec["last_seen"] = now
                     rec["status"] = r["status"]
@@ -592,6 +719,11 @@ def poller():
             for key in [k for k, v in CONNS.items()
                         if now - v["last_seen"] > DROP_AFTER]:
                 del CONNS[key]
+            for v in CONNS.values():          # keep last_seen fresh in history
+                h = HISTORY.get(v["ip"])
+                if h is not None and v["last_seen"] == now:
+                    h["last_seen"] = now
+            _history_trim()
         if psutil is not None:
             try:
                 io = psutil.net_io_counters()
@@ -809,6 +941,7 @@ def geo_worker():
                 geolocate_home()
         if now - last_save > CACHE_SAVE_EVERY:
             _save_cache()
+            _save_history()
             last_save = now
         time.sleep(3)
 
@@ -889,7 +1022,9 @@ def snapshot():
         "geo_state": GEO_STATE,
         "scan_error": SCAN_ERROR,
         "psutil": psutil is not None,
-        "collector": "psutil" if psutil is not None else _collector_name(),
+        "collector": _collector_name() if (psutil is None
+                                           or sys.platform.startswith("linux"))
+                     else "psutil",
         "threat": threat_stat,
         "tailnet": ts,
         "stats": {
@@ -929,6 +1064,10 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/" or self.path.startswith("/index"):
             body = HTML_PAGE.replace("__NETMAP_TOKEN__", QUIT_TOKEN).encode("utf-8")
             ctype = "text/html; charset=utf-8"
+        elif self.path.startswith("/history"):
+            body = json.dumps({"max": HISTORY_MAX,
+                               "hosts": _history_snapshot()}).encode("utf-8")
+            ctype = "application/json"
         elif self.path.startswith("/data"):
             body = json.dumps(snapshot()).encode("utf-8")
             ctype = "application/json"
@@ -964,6 +1103,7 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             _save_cache()
+            _save_history()
             threading.Thread(target=self.server.shutdown, daemon=True).start()
         else:
             self.send_response(404)
@@ -1061,6 +1201,16 @@ HTML_PAGE = r"""<!DOCTYPE html>
     color:var(--text-primary);font:inherit;outline:none}
   .filter input:focus{border-color:var(--series-1)}
   #list{overflow-y:auto;flex:1;padding:6px 0}
+  .tabs{display:flex;gap:4px;padding:8px 12px 0}
+  .tabs button{flex:1;background:transparent;color:var(--text-muted);font:inherit;
+    font-size:12px;border:1px solid transparent;border-bottom:none;cursor:pointer;
+    padding:6px 8px;border-radius:7px 7px 0 0}
+  .tabs button:hover{color:var(--text-primary)}
+  .tabs button.on{background:var(--surface-1);color:var(--text-primary);
+    border-color:var(--border)}
+  .tabs .n{color:var(--text-muted);font-size:10.5px;margin-left:3px}
+  .host .when{color:var(--text-muted);font-size:11px;margin-top:1px}
+  .hist-note{padding:6px 12px 2px;color:var(--text-muted);font-size:10.5px}
   .host{padding:8px 12px;border-bottom:1px solid #262623;cursor:pointer}
   .host:hover{background:var(--surface-3)}
   .host.inactive{opacity:.45}
@@ -1176,6 +1326,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
   <main>
     <div id="map"></div>
     <aside>
+      <div class="tabs" role="tablist">
+        <button id="tabLive" class="on" role="tab">Live</button>
+        <button id="tabHist" role="tab"
+          title="Every remote address seen, newest first (up to 2048)">History<span
+          class="n" id="histN"></span></button>
+      </div>
       <div class="filter">
         <input id="q" type="search" placeholder="Filter by process, IP, country&hellip;"
                autocomplete="off">
@@ -1472,9 +1628,74 @@ function render(d){
   renderList();
 }
 
+// ---- History tab ----
+let tab = "live", hist = null, histAt = 0;
+function ago(sec){
+  sec = Math.max(0, Math.round(sec));
+  if(sec < 60) return sec + "s ago";
+  if(sec < 3600) return Math.floor(sec/60) + "m ago";
+  if(sec < 86400) return Math.floor(sec/3600) + "h ago";
+  return Math.floor(sec/86400) + "d ago";
+}
+async function loadHistory(force){
+  if(!force && Date.now() - histAt < 10000) return;
+  histAt = Date.now();
+  try{
+    const res = await fetch("/history", {cache:"no-store"});
+    hist = await res.json();
+    document.getElementById("histN").textContent = hist.hosts.length;
+    if(tab === "history") renderList();
+  }catch(e){}
+}
+function setTab(t){
+  tab = t;
+  document.getElementById("tabLive").classList.toggle("on", t === "live");
+  document.getElementById("tabHist").classList.toggle("on", t === "history");
+  if(t === "history") loadHistory(true);
+  renderList();
+}
+document.getElementById("tabLive").addEventListener("click", () => setTab("live"));
+document.getElementById("tabHist").addEventListener("click", () => setTab("history"));
+
+function renderHistory(q){
+  const list = document.getElementById("list");
+  if(!hist){ list.innerHTML = '<div class="empty">Loading history&hellip;</div>'; return; }
+  const now = Date.now() / 1000;
+  const live = new Set((latest ? latest.hosts : []).filter(h => h.active).map(h => h.ip));
+  const rows = [];
+  for(const h of hist.hosts){
+    const g = h.geo || {};
+    const labels = (h.threat_labels || []).join(" ");
+    const hay = (h.ip + " " + h.procs.join(" ") + " " + (g.country||"") + " "
+      + (g.city||"") + " " + (g.isp||"") + " " + labels
+      + (h.threat ? " flagged threat" : "")).toLowerCase();
+    if(q && !hay.includes(q)) continue;
+    const tb = h.threat
+      ? '<div class="threatline"><span class="badge-threat">&#9888; '
+        + esc(labels || "flagged") + "</span></div>" : "";
+    rows.push('<div class="host' + (live.has(h.ip) ? "" : " inactive")
+      + (h.threat ? " flag" : "") + '" data-ip="' + esc(h.ip) + '">' + tb
+      + '<div class="top"><div class="procs">' + esc(h.procs.join(", "))
+      + '</div><div class="cnt">' + h.conns + (h.conns === 1 ? " conn" : " conns")
+      + "</div></div>"
+      + '<div class="loc">' + flag(g.countryCode) + " " + esc(g.city ? g.city + ", " : "")
+      + esc(g.country || "unknown location")
+      + (g.isp ? " &middot; " + esc(g.isp) : "") + "</div>"
+      + '<div class="ipline">' + esc(h.ip) + "&ensp;"
+      + esc(h.ports.map(p => ":" + p).join(" ")) + "</div>"
+      + '<div class="when">' + (live.has(h.ip) ? "live now" : "last seen " + ago(now - h.last_seen))
+      + " &middot; first seen " + ago(now - h.first_seen) + "</div></div>");
+  }
+  list.innerHTML = '<div class="hist-note">' + hist.hosts.length + " of " + hist.max
+    + " addresses kept &middot; oldest dropped first</div>"
+    + (rows.length ? rows.join("")
+       : '<div class="empty">' + (q ? "No matches." : "Nothing recorded yet&hellip;") + "</div>");
+}
+
 function renderList(){
   if(!latest) return;
   const q = document.getElementById("q").value.trim().toLowerCase();
+  if(tab === "history") return renderHistory(q);
   const list = document.getElementById("list");
   const rows = [];
   for(const h of latest.hosts){
@@ -1571,6 +1792,7 @@ async function tick(){
     const res = await fetch("/data", {cache:"no-store"});
     render(await res.json());
   }catch(e){ /* server briefly unavailable; retry on next tick */ }
+  loadHistory(false);   // refreshes the History tab and its count every 10 s
 }
 tick();
 setInterval(tick, 2500);
@@ -1618,12 +1840,15 @@ def main():
             sys.exit("--home must look like 39.74,-104.99")
 
     print("NetMap v%s starting..." % VERSION)
-    if psutil is None:
+    if sys.platform.startswith("linux"):
+        print("  reading sockets from %s" % _collector_name())
+    elif psutil is None:
         print("  reading sockets with the standard library (%s); psutil is "
               "optional and not installed" % _collector_name())
     else:
         print("  reading sockets via psutil")
     _load_cache()
+    _load_history()
 
     threading.Thread(target=poller, daemon=True).start()
     threading.Thread(target=geo_worker, daemon=True).start()
@@ -1663,11 +1888,17 @@ def main():
                   "from other machines will get 403. Add the server's IP or name.")
     if not args.no_browser:
         threading.Timer(1.0, lambda: webbrowser.open(url)).start()
+    # `docker stop` and TrueNAS send SIGTERM, not Ctrl+C: save state on it too,
+    # or every restart would lose up to CACHE_SAVE_EVERY seconds of history.
+    if hasattr(signal, "SIGTERM"):
+        signal.signal(signal.SIGTERM, lambda *_: (_save_cache(), _save_history(),
+                                                  sys.exit(0)))
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\nNetMap stopped.")
         _save_cache()
+        _save_history()
 
 
 if __name__ == "__main__":
