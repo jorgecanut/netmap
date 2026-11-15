@@ -83,6 +83,8 @@ Your browser opens to `http://localhost:8339` automatically. Press `Ctrl+C` to s
 | `--interval S` | Seconds between connection scans (default 2) |
 | `--no-browser` | Don't auto-open the browser |
 | `--home LAT,LON` | Set your map location manually (skips self-geolocation) |
+| `--bind ADDR` | Listen address (default `127.0.0.1`; `0.0.0.0` for your network, no login). Env `NETMAP_BIND` |
+| `--allow-host NAMES` | Hostnames/IPs browsers may use, e.g. `192.168.1.50,truenas.local`. Env `NETMAP_ALLOWED_HOSTS` |
 
 ### Docker (Linux)
 

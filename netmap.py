@@ -110,6 +110,9 @@ CACHE_SAVE_EVERY = 30
 LOCK = threading.Lock()
 CONNS = {}            # key -> {ip, port, proto, status, pid, proc, first_seen, last_seen}
 GEO = {}              # ip  -> {status: ok|pending|fail, ts, ...fields}
+# Names the browser may use to reach NetMap (checked against the Host header).
+# localhost only by default; --bind / --allow-host extend it for LAN access.
+ALLOWED_HOSTS = {"localhost", "127.0.0.1"}
 HOME = None           # {lat, lon, city, country, countryCode, query} or None
 GEO_STATE = "waiting" # waiting | ok | offline
 RATES = {"down_bps": 0.0, "up_bps": 0.0}
@@ -906,7 +909,7 @@ def snapshot():
 class Handler(BaseHTTPRequestHandler):
     def _allowed_hosts(self):
         port = self.server.server_address[1]
-        return {"localhost:%d" % port, "127.0.0.1:%d" % port}
+        return {"%s:%d" % (h, port) for h in ALLOWED_HOSTS}
 
     def _host_ok(self):
         """Block DNS rebinding: a hostile site that re-points its own domain at
@@ -1592,6 +1595,15 @@ def main():
     ap.add_argument("--port", type=int, default=env_port)
     ap.add_argument("--interval", type=float, default=2.0)
     ap.add_argument("--no-browser", action="store_true")
+    ap.add_argument("--bind", metavar="ADDR",
+                    default=os.environ.get("NETMAP_BIND") or "127.0.0.1",
+                    help="IPv4 address to listen on (default 127.0.0.1; "
+                         "0.0.0.0 = every interface). Env: NETMAP_BIND")
+    ap.add_argument("--allow-host", metavar="NAMES",
+                    default=os.environ.get("NETMAP_ALLOWED_HOSTS") or "",
+                    help="comma-separated hostnames/IPs browsers may use to reach "
+                         "NetMap, e.g. 192.168.1.50,truenas.local. "
+                         "Env: NETMAP_ALLOWED_HOSTS")
     ap.add_argument("--home", metavar="LAT,LON",
                     help="set your map location manually, e.g. 39.74,-104.99")
     args = ap.parse_args()
@@ -1618,9 +1630,15 @@ def main():
     threading.Thread(target=threat_worker, daemon=True).start()
     threading.Thread(target=tailnet_worker, daemon=True).start()
 
+    for name in args.allow_host.split(","):
+        if name.strip():
+            ALLOWED_HOSTS.add(name.strip().lower())
+    if args.bind not in ("0.0.0.0", ""):
+        ALLOWED_HOSTS.add(args.bind.lower())
+    loopback_only = args.bind.startswith("127.")
     url = "http://localhost:%d" % args.port
     try:
-        server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
+        server = ThreadingHTTPServer((args.bind, args.port), Handler)
     except OSError as e:
         # Port taken. Usually that means NetMap is already running, so re-open
         # the existing map — but it can also be an unrelated program sitting on
@@ -1633,7 +1651,16 @@ def main():
         if not args.no_browser:
             webbrowser.open(url)
         return
-    print("  serving on %s   (Ctrl+C to stop)" % url)
+    if loopback_only:
+        print("  serving on %s   (Ctrl+C to stop)" % url)
+    else:
+        print("  listening on %s:%d - reachable from your network, with NO login"
+              % (args.bind, args.port))
+        print("  open it as: %s" % ", ".join(
+            "http://%s:%d" % (h, args.port) for h in sorted(ALLOWED_HOSTS)))
+        if ALLOWED_HOSTS == {"localhost", "127.0.0.1"}:
+            print("  WARNING: no --allow-host / NETMAP_ALLOWED_HOSTS set, so requests "
+                  "from other machines will get 403. Add the server's IP or name.")
     if not args.no_browser:
         threading.Timer(1.0, lambda: webbrowser.open(url)).start()
     try:
