@@ -26,10 +26,12 @@ Notes:
 """
 
 import argparse
+import hmac
 import ipaddress
 import json
 import os
 import re
+import secrets
 import socket
 import subprocess
 import sys
@@ -89,7 +91,7 @@ if hasattr(threading, "excepthook"):        # 3.8+
 # Configuration / shared state
 # ----------------------------------------------------------------------------
 
-VERSION = "2026.08.20.2"   # date + same-day build number, matching NetWatch, so
+VERSION = "2026.11.15.1"   # date + same-day build number, matching NetWatch, so
                            # the running build can be identified from the header
                            # and the startup log rather than guessed at
 DEFAULT_PORT = 8339
@@ -112,6 +114,9 @@ GEO_STATE = "waiting" # waiting | ok | offline
 RATES = {"down_bps": 0.0, "up_bps": 0.0}
 SCAN_ERROR = None
 POLL_INTERVAL = 2.0
+# Random per-run secret embedded in the page. State-changing requests (/quit)
+# must echo it back, so only the page NetMap itself served can issue them.
+QUIT_TOKEN = secrets.token_urlsafe(32)
 
 # Tailscale
 TAILNET = {"available": None, "self": None, "peers": [], "error": None}
@@ -341,10 +346,18 @@ def collect_psutil():
     return out
 
 
+def _sys32(exe):
+    """Absolute path to a Windows system tool. Running it by bare name would let a
+    same-named .exe in the current directory (NetMap.bat cd's to the script
+    folder) be picked up instead of the real one."""
+    root = os.environ.get("SystemRoot") or r"C:\Windows"
+    return os.path.join(root, "System32", exe)
+
+
 def _tasklist_names():
     names = {}
     try:
-        out = subprocess.run(["tasklist", "/fo", "csv", "/nh"],
+        out = subprocess.run([_sys32("tasklist.exe"), "/fo", "csv", "/nh"],
                              capture_output=True, text=True, timeout=15).stdout
         for line in out.splitlines():
             parts = [p.strip('"') for p in line.split('","')]
@@ -359,7 +372,7 @@ def _tasklist_names():
 
 
 def collect_netstat_windows():
-    out = subprocess.run(["netstat", "-ano"], capture_output=True,
+    out = subprocess.run([_sys32("netstat.exe"), "-ano"], capture_output=True,
                          text=True, timeout=20).stdout
     names = _tasklist_names()
     rows = []
@@ -890,9 +903,27 @@ def snapshot():
 
 
 class Handler(BaseHTTPRequestHandler):
+    def _allowed_hosts(self):
+        port = self.server.server_address[1]
+        return {"localhost:%d" % port, "127.0.0.1:%d" % port}
+
+    def _host_ok(self):
+        """Block DNS rebinding: a hostile site that re-points its own domain at
+        127.0.0.1 still sends its own name in Host, so only accept requests that
+        were addressed to this machine's loopback by name or address."""
+        host = (self.headers.get("Host") or "").lower()
+        return host in self._allowed_hosts()
+
+    def _reject(self, code=403):
+        self.send_response(code)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     def do_GET(self):
+        if not self._host_ok():
+            return self._reject()
         if self.path == "/" or self.path.startswith("/index"):
-            body = HTML_PAGE.encode("utf-8")
+            body = HTML_PAGE.replace("__NETMAP_TOKEN__", QUIT_TOKEN).encode("utf-8")
             ctype = "text/html; charset=utf-8"
         elif self.path.startswith("/data"):
             body = json.dumps(snapshot()).encode("utf-8")
@@ -905,10 +936,22 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
         self.end_headers()
         self.wfile.write(body)
 
     def do_POST(self):
+        # Three independent checks, any one of which stops a cross-site request:
+        # Host (DNS rebinding), Origin (CSRF from any other page), and the per-run
+        # token (a custom header also forces a CORS preflight we never answer).
+        origin = self.headers.get("Origin")
+        origin_ok = origin is None or any(
+            origin.lower() == "http://" + h for h in self._allowed_hosts())
+        token_ok = hmac.compare_digest(
+            self.headers.get("X-NetMap-Token", ""), QUIT_TOKEN)
+        if not (self._host_ok() and origin_ok and token_ok):
+            return self._reject()
         if self.path == "/quit":
             body = b'{"ok": true}'
             self.send_response(200)
@@ -937,7 +980,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <title>NetMap — live connection map</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <link rel="stylesheet"
-  href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+  href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css"
+  integrity="sha512-h9FcoyWjHcOcmEVkxOfTLnmZFWIH0iZhZT1H2TbOq55xssQGEJHEaIm+PgoUaZbRvQTNTluNOEfb1ZRy6D3BOw=="
+  crossorigin="anonymous" referrerpolicy="no-referrer">
 <style>
   :root{
     color-scheme: dark;
@@ -1138,7 +1183,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <div id="banner"></div>
 <div id="stopped"><div><b>NetMap stopped</b>You can close this tab.<br>
 Double-click NetMap again to restart it.</div></div>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"
+  integrity="sha512-puJW3E/qXDqYp9IfhAI54BJEaWIfloJ7JWs7OeD5i6ruC9JZL1gERT1wjtwXFlh7CjE7ZJ+/vcRZRkIYIb6p4g=="
+  crossorigin="anonymous" referrerpolicy="no-referrer"></script>
 <script>
 "use strict";
 const HAS_MAP = typeof L !== "undefined";
@@ -1509,7 +1556,8 @@ document.getElementById("q").addEventListener("input", renderList);
 let quitting = false;
 document.getElementById("quitBtn").addEventListener("click", async () => {
   quitting = true;
-  try{ await fetch("/quit", {method:"POST"}); }catch(e){}
+  try{ await fetch("/quit", {method:"POST",
+    headers:{"X-NetMap-Token": "__NETMAP_TOKEN__"}}); }catch(e){}
   document.getElementById("stopped").style.display = "grid";
 });
 
