@@ -79,7 +79,7 @@ Your browser opens to `http://localhost:8339` automatically. Press `Ctrl+C` to s
 
 | Flag | Description |
 |------|-------------|
-| `--port N` | Serve on a different port (default 8339) |
+| `--port N` | Serve on a different port (default 8339, or the `NETMAP_PORT` env var) |
 | `--interval S` | Seconds between connection scans (default 2) |
 | `--no-browser` | Don't auto-open the browser |
 | `--home LAT,LON` | Set your map location manually (skips self-geolocation) |

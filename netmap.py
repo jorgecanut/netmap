@@ -6,7 +6,8 @@ Usage:
     python netmap.py                 (opens http://localhost:8339 in your browser)
 
 Options:
-    --port N         serve on a different port            (default 8339)
+    --port N         serve on a different port            (default 8339,
+                     or the NETMAP_PORT environment variable)
     --interval S     seconds between connection scans     (default 2)
     --no-browser     don't auto-open the browser
     --home LAT,LON   set your own map location manually   (skips self-geolocation)
@@ -1582,7 +1583,13 @@ setInterval(tick, 2500);
 def main():
     global POLL_INTERVAL, HOME, GEO_STATE
     ap = argparse.ArgumentParser(description="NetMap - live connection world map")
-    ap.add_argument("--port", type=int, default=DEFAULT_PORT)
+    # NETMAP_PORT lets a container set the port in its environment; an explicit
+    # --port on the command line still wins.
+    try:
+        env_port = int(os.environ.get("NETMAP_PORT") or DEFAULT_PORT)
+    except ValueError:
+        sys.exit("NETMAP_PORT must be a number, got %r" % os.environ["NETMAP_PORT"])
+    ap.add_argument("--port", type=int, default=env_port)
     ap.add_argument("--interval", type=float, default=2.0)
     ap.add_argument("--no-browser", action="store_true")
     ap.add_argument("--home", metavar="LAT,LON",

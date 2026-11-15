@@ -37,6 +37,7 @@ services:
 
     environment:
       - NETMAP_DATA_DIR=/data
+      - NETMAP_PORT=8339        # the port the map is served on
     volumes:
       - netmap-data:/data
     # Extra CLI flags, e.g.:  command: ["--port", "8340", "--home", "39.74,-104.99"]
