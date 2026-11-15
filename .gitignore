@@ -4,10 +4,14 @@ __pycache__/
 *.pyo
 
 # NetMap runtime state (generated at run time — do not commit)
+netmap.sqlite*
+geoip.sqlite*
+threat_lists/
+router_key*
+router_known_hosts
 netmap_geo_cache.json
 netmap_threat_cache.json
-netmap_history.json
-netmap_history.json.tmp
+netmap_history.json*
 netmap.log
 
 # git lock/tmp files the Cowork device bridge creates but cannot unlink

@@ -1,2 +1,4 @@
 *
 !netmap.py
+!netmap_core/
+netmap_core/**/__pycache__

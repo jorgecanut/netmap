@@ -1,24 +1,25 @@
 @echo off
 rem NetMap launcher - starts netmap.py with no console window.
 rem Keep this file in the same folder as netmap.py.
+rem --no-auth: on your own PC (127.0.0.1 only) there is no login screen.
 cd /d "%~dp0"
 
 where pythonw >nul 2>nul
 if %errorlevel%==0 (
-    start "" pythonw netmap.py
+    start "" pythonw netmap.py --no-auth
     exit /b
 )
 
 where pyw >nul 2>nul
 if %errorlevel%==0 (
-    start "" pyw netmap.py
+    start "" pyw netmap.py --no-auth
     exit /b
 )
 
 rem Fallback: visible (minimized) console via regular python.
 where python >nul 2>nul
 if %errorlevel%==0 (
-    start "NetMap" /min python netmap.py
+    start "NetMap" /min python netmap.py --no-auth
     exit /b
 )
 

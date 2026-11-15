@@ -2,7 +2,8 @@
 #
 #   docker compose up -d --build     then open http://localhost:8339
 #
-# NetMap maps the HOST's connections, so the container shares the host's network
+# NetMap maps the HOST's connections (This machine tab) and, once a router is set up,
+# every device's (Network tab). The container shares the host's network
 # and process namespaces. That is also why the server's 127.0.0.1 bind still
 # means "this machine only": with host networking it is the host's loopback.
 #
@@ -35,12 +36,16 @@ services:
     read_only: true
     tmpfs: [/tmp]
 
+    # First start: `docker logs netmap` prints a setup code for the admin password.
+    # Router, subnets, device names and rules are set in the web UI.
+    # All variables: docs/DOCKER.md
     environment:
       - NETMAP_DATA_DIR=/data
       - NETMAP_PORT=8339        # the port the map is served on
-      # To open the map from other machines (no login - anyone on the network can see it):
+      - NETMAP_MAX_DB_MB=4096   # connection log cap; oldest deleted first
+      # To reach it from other machines or a reverse proxy (login required):
       # - NETMAP_BIND=0.0.0.0
-      # - NETMAP_ALLOWED_HOSTS=192.168.1.50,myserver.local
+      # - NETMAP_ALLOWED_HOSTS=192.168.1.50,netmap.example.com
     volumes:
       - netmap-data:/data
     # Extra CLI flags, e.g.:  command: ["--port", "8340", "--home", "39.74,-104.99"]

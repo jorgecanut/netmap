@@ -1,122 +1,135 @@
 # NetMap
 
-**A live world map of your computer's network connections — in your browser.**
+**A live world map of your computer's connections, and of every device on your network, in your browser.**
 
-![Python](https://img.shields.io/badge/python-3.7%2B-blue)
+![Python](https://img.shields.io/badge/python-3.8%2B-blue)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey)
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Dependencies](https://img.shields.io/badge/dependencies-none%20(stdlib)-brightgreen)
 [![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-ffdd00?logo=buymeacoffee&logoColor=black)](https://buymeacoffee.com/huskerminion)
 
-NetMap watches the active network connections leaving *your computer*, geolocates
-the remote servers, and plots them on a live, dark-themed world map with animated
-arcs from your location to each destination. Hover any point to see the process,
-port, city, and ISP behind it.
+NetMap plots network connections on a live, dark-themed world map with animated
+arcs from home to each destination. It has two views:
 
-A single Python file, no packages required, on every supported OS. `psutil` is
-optional — if it happens to be installed NetMap uses it, since it is faster and
-reports throughput, but nothing depends on it.
+- **This machine**: every connection of the computer NetMap runs on, per process,
+  including connections made inside Docker containers on Linux.
+- **Network**: every connection of every device on your network, read from an
+  OpenWrt router. Devices get names, subnets get colours, and you can filter by subnet.
 
-> **Want your whole network** — phones, TVs, IoT, every device — instead of just
-> one computer? See the sibling project **[NetWatch](../../netwatch)**, which does
-> the same thing network-wide from a mirrored switch port.
+Every connection is **logged** with its time, device, direction and approximate location *at that
+moment*, and **classified**: public blocklists (botnet C2, hijacked networks,
+attackers, Tor…) plus **your own rules**, written in the web UI. A **timeline**
+under the map replays any moment in the past.
 
----
-
-## Screenshot
-
-The left panel is a live dark-themed world map with animated arcs from your
-location to each remote host; the right panel lists every connection with its
-process, city, and ISP. NetMap shares its interface with its network-wide sibling
-**[NetWatch](../../netwatch)** — see the screenshots there for the look and feel.
-
+Python standard library only. One SQLite database. No build step.
 
 ![NetMap live map](docs/netmap.png)
 
-
-## Why a helper script instead of a plain web page?
-
-A browser is sandboxed and cannot see your computer's network connections. NetMap
-runs a tiny local server that reads the connection table, does the geolocation,
-and serves the map at `http://localhost:8339` for you to open. Nothing is exposed
-to your network — it binds to `127.0.0.1` only.
-
 ## Features
 
-- Live map of every outbound connection from your machine, updated every ~2s
-- Your own location shown as a pulsing home marker, with animated arcs to each host
-- Markers sized by connection count; hover for process, port, city, and ISP
-- **Threat-intelligence flagging** against Tor exit nodes, FireHOL level-1 and
-  Spamhaus DROP (auto-refreshed, disk-cached): blocklisted destinations turn red,
-  sort to the top of the list, and the tooltip names *which* list matched
-- Filterable side panel and live stats (active connections, hosts, flagged,
-  countries, ↑/↓ rate)
-- **History tab**: every remote address seen, with process, ports, location and
-  first/last seen — capped at 2048 addresses (oldest dropped first, ~0.5 MB on
-  disk) and saved to `netmap_history.json` so it survives restarts
-- On Linux, also sees connections made inside Docker containers
-- Graceful fallbacks when the map tiles or geolocation service are blocked
-- Geolocation results cached locally so restarts light up instantly
+- Live map with pulsing markers and arcs; inbound connections animate towards home
+- **Network tab** from an OpenWrt router: outgoing, incoming (port forwards),
+  between-subnet and router traffic, with device names (DHCP) and domain names (dnsmasq)
+- **Subnets** with names and colours, managed in the app; filter map, list and history by subnet
+- **Connection log** in SQLite with a size cap (default 4 GB, oldest first), so months of history fit
+- **History tab** per view, searchable, paged, *flagged only* filter; click a row to see the map at that moment
+- **Timeline**: scrub or replay the last hour, day, week, month or year
+- **Threat classification**: Feodo Tracker, Spamhaus DROP, FireHOL level 1,
+  blocklist.de, CINS Army and Tor exits, each with a category and severity
+- **Behaviour rules** in Python syntax, edited and tested in the UI, run in a safe
+  interpreter (see [docs/RULES.md](docs/RULES.md)); e.g. `subnet == "IoT" and new_country`
+- **Verdicts**: trust, mark suspicious or ignore an IP, domain or device
+- **Offline geolocation** (DB-IP Lite, refreshed monthly, ~720 MB on disk). Addresses it doesn't know are
+  looked up once on ip-api.com and stored
+- **Admin login** (scrypt-hashed password, CSRF protection, lockout); works behind a reverse proxy
+- Tailscale peers on the This machine view
 
-## Requirements
-
-- Python 3.7+ — and nothing else
-- Optional: `psutil`. Used automatically when present (faster, adds throughput).
-  Without it NetMap reads the socket table directly: `/proc/net` on Linux,
-  `netstat -ano` + `tasklist` on Windows, `lsof` on macOS.
-
-Sockets owned by *other* users are only attributable when running elevated; your
-own processes always resolve.
-
-## Quick start
+## Quick start (your own PC)
 
 ```bash
-python netmap.py
+python netmap.py --no-auth
 ```
 
-Your browser opens to `http://localhost:8339` automatically. Press `Ctrl+C` to stop.
+Your browser opens `http://localhost:8339`. `--no-auth` skips the login and is only
+allowed while NetMap listens on 127.0.0.1. On Windows, double-click `NetMap.bat`,
+which does this without a console window.
 
-**Windows:** double-click `NetMap.bat` to launch it with no console window (right-click
-→ *Send to → Desktop* to make a desktop shortcut).
+Without `--no-auth` the first start prints a **setup code** in the console. Enter it
+in the page to choose the admin password.
 
-### Options
-
-| Flag | Description |
-|------|-------------|
-| `--port N` | Serve on a different port (default 8339, or the `NETMAP_PORT` env var) |
-| `--interval S` | Seconds between connection scans (default 2) |
-| `--no-browser` | Don't auto-open the browser |
-| `--home LAT,LON` | Set your map location manually (skips self-geolocation) |
-| `--bind ADDR` | Listen address (default `127.0.0.1`; `0.0.0.0` for your network, no login). Env `NETMAP_BIND` |
-| `--allow-host NAMES` | Hostnames/IPs browsers may use, e.g. `192.168.1.50,truenas.local`. Env `NETMAP_ALLOWED_HOSTS` |
-
-### Docker (Linux)
+## Server, Docker, TrueNAS
 
 ```bash
 docker compose up -d --build
+docker logs netmap            # shows the setup code on first start
 ```
 
-Then open `http://localhost:8339`. The container shares the host's network and PID
-namespaces so it maps the *host's* connections; caches persist in the `netmap-data`
-volume. See `docker-compose.yml` for the privileges it needs and why. On Docker
-Desktop (macOS/Windows) containers run in a VM, so run `netmap.py` natively there.
+See **[docs/DOCKER.md](docs/DOCKER.md)** for TrueNAS, reverse proxies and every
+`NETMAP_*` variable.
+
+## Network tab: your router
+
+Setting up the router takes about ten minutes, once: install `conntrack`, copy one small script, and add
+NetMap's key, which can only run that script. Follow **[docs/ROUTER.md](docs/ROUTER.md)**
+(written for OpenWrt 25.x).
+
+## Requirements
+
+- Python 3.8+. Nothing to install.
+- Optional `psutil` for the up/down rate tiles.
+- For the Network tab: an OpenWrt router and an `ssh` client (included in the Docker image).
+
+Sockets of *other* users' processes are only attributable when running elevated
+(or in Docker with the privileges in `docker-compose.yml`). Your own always resolve.
+
+## Options
+
+`python netmap.py --help` lists them all. Each has an environment variable:
+
+| Flag | Env | Default |
+|---|---|---|
+| `--port N` | `NETMAP_PORT` | 8339 |
+| `--bind ADDR` | `NETMAP_BIND` | 127.0.0.1 |
+| `--allow-host NAMES` | `NETMAP_ALLOWED_HOSTS` | localhost |
+| `--data-dir DIR` | `NETMAP_DATA_DIR` | next to `netmap.py` |
+| `--max-db-mb N` | `NETMAP_MAX_DB_MB` | 4096 |
+| `--home LAT,LON` | `NETMAP_HOME` | located automatically |
+| `--no-auth` | `NETMAP_AUTH=off` | login on |
+| `--no-geo-download` | `NETMAP_GEO_DOWNLOAD=off` | download offline DB |
+| `--no-geo-online` | `NETMAP_GEO_ONLINE=off` | use ip-api.com fallback |
+| `--reset-password` | | clears the admin password |
 
 ## Privacy
 
-NetMap binds to `127.0.0.1` only — nothing is exposed to your network. The only
-data that leaves your machine is the set of remote IP addresses sent to the free
-[ip-api.com](https://ip-api.com) service for geolocation, cached locally in
-`netmap_geo_cache.json`. Use `--home LAT,LON` to skip locating yourself.
+Everything is stored locally in the data folder. What leaves the machine:
 
-## How it works
+- **Remote IPs the offline database doesn't know** go to [ip-api.com](https://ip-api.com)
+  (plain HTTP, the free tier has no HTTPS), once per IP. Turn it off with `NETMAP_GEO_ONLINE=off`.
+- Your public IP is sent to ip-api.com once to place "home" on the map. Skip it with `--home`.
+- Downloads: the DB-IP database (monthly), the blocklists (every 6 h), map tiles and Leaflet.
 
-NetMap reads your machine's connection table (via `psutil` when available,
-otherwise the platform's own socket table), keeps only connections to public IPs,
-geolocates them in batches, checks each against public reputation blocklists, and
-serves a single self-contained HTML page that renders the map with
-[Leaflet](https://leafletjs.com/) and polls a small JSON endpoint.
+NetMap logs every device's destinations, which is sensitive. Keep the login on,
+don't expose the port to the internet, and keep `NETMAP_ALLOWED_HOSTS` exact.
 
-The page is served on `127.0.0.1` only — it is not reachable from your network.
+## Documentation
+
+| | |
+|---|---|
+| [docs/ROUTER.md](docs/ROUTER.md) | OpenWrt setup and troubleshooting |
+| [docs/RULES.md](docs/RULES.md) | rule language, fields, examples |
+| [docs/DOCKER.md](docs/DOCKER.md) | Docker, TrueNAS, reverse proxy, environment variables |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | how it works, files, debugging, tests, common changes |
+
+Tests: `python -m unittest discover -s tests -t .`
+
+## Credits
+
+Map: [Leaflet](https://leafletjs.com/), © [OpenStreetMap](https://www.openstreetmap.org/copyright)
+contributors, © [CARTO](https://carto.com/attributions). IP geolocation by
+[DB-IP](https://db-ip.com) (CC BY 4.0) and [ip-api.com](https://ip-api.com).
+Blocklists by [abuse.ch](https://abuse.ch), [Spamhaus](https://www.spamhaus.org),
+[FireHOL](https://iplists.firehol.org), [blocklist.de](https://www.blocklist.de),
+[CINS Army](https://cinsscore.com) and the [Tor Project](https://www.torproject.org).
 
 ## License
 
