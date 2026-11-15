@@ -51,7 +51,10 @@ except ImportError:
 # error and nothing listening on the port — indistinguishable from "it just
 # doesn't start". Route output and every traceback to netmap.log beside the
 # script so a silent failure always leaves evidence.
-_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "netmap.log")
+# NETMAP_DATA_DIR moves the log and caches elsewhere (the Docker image points it
+# at a volume); by default they live beside the script, as before.
+DATA_DIR = os.environ.get("NETMAP_DATA_DIR") or os.path.dirname(os.path.abspath(__file__))
+_LOG_PATH = os.path.join(DATA_DIR, "netmap.log")
 _WINDOWLESS = sys.stdout is None or sys.stderr is None
 if _WINDOWLESS:
     try:
@@ -94,8 +97,7 @@ GEO_BATCH_URL = ("http://ip-api.com/batch?fields=status,message,country,"
                  "countryCode,regionName,city,lat,lon,isp,org,query")
 GEO_SELF_URL = ("http://ip-api.com/json/?fields=status,country,countryCode,"
                 "regionName,city,lat,lon,query")
-CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                          "netmap_geo_cache.json")
+CACHE_FILE = os.path.join(DATA_DIR, "netmap_geo_cache.json")
 
 STALE_AFTER = 8       # seconds without being seen -> connection shown as fading
 DROP_AFTER = 90       # seconds without being seen -> connection removed
@@ -125,8 +127,7 @@ TS_POLL = 10          # seconds between `tailscale status` polls
 # verdict on whether any of them were dangerous, which was its biggest gap: a
 # map of where your traffic goes is much more useful when the bad dots are red.
 
-THREAT_CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                            "netmap_threat_cache.json")
+THREAT_CACHE = os.path.join(DATA_DIR, "netmap_threat_cache.json")
 THREAT_REFRESH = 6 * 3600
 THREAT_CACHE_MAX = 50000     # cap the match memo (bounds long-run memory)
 THREAT_LOCK = threading.RLock()

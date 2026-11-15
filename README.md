@@ -84,6 +84,17 @@ Your browser opens to `http://localhost:8339` automatically. Press `Ctrl+C` to s
 | `--no-browser` | Don't auto-open the browser |
 | `--home LAT,LON` | Set your map location manually (skips self-geolocation) |
 
+### Docker (Linux)
+
+```bash
+docker compose up -d --build
+```
+
+Then open `http://localhost:8339`. The container shares the host's network and PID
+namespaces so it maps the *host's* connections; caches persist in the `netmap-data`
+volume. See `docker-compose.yml` for the privileges it needs and why. On Docker
+Desktop (macOS/Windows) containers run in a VM, so run `netmap.py` natively there.
+
 ## Privacy
 
 NetMap binds to `127.0.0.1` only — nothing is exposed to your network. The only

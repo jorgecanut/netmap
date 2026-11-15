@@ -1,0 +1,45 @@
+# NetMap in Docker (Linux hosts).
+#
+#   docker compose up -d --build     then open http://localhost:8339
+#
+# NetMap maps the HOST's connections, so the container shares the host's network
+# and process namespaces. That is also why the server's 127.0.0.1 bind still
+# means "this machine only": with host networking it is the host's loopback.
+#
+# Docker Desktop (macOS / Windows) runs containers in a VM, so there you would
+# see the VM's connections, not your computer's. Run netmap.py natively there.
+
+services:
+  netmap:
+    build: .
+    image: netmap:latest
+    container_name: netmap
+    restart: unless-stopped
+
+    network_mode: host    # see the host's sockets (/proc/net) and serve on its loopback
+    pid: host             # map each socket to the host process that owns it
+
+    # Least privilege: drop everything, then add back only what reading other
+    # processes' /proc/<pid>/fd needs. Without these the map still works, but
+    # most connections show as "unknown" instead of a process name.
+    cap_drop: [ALL]
+    cap_add:
+      - SYS_PTRACE        # readlink /proc/<pid>/fd/* for processes we don't own
+      - DAC_READ_SEARCH   # list /proc/<pid>/fd directories owned by other users
+    security_opt:
+      - no-new-privileges:true
+      # Docker's default AppArmor profile denies ptrace-read on host processes,
+      # which blocks the socket -> process lookup above. Remove this line to keep
+      # AppArmor on, at the cost of process names showing as "system".
+      - apparmor:unconfined
+    read_only: true
+    tmpfs: [/tmp]
+
+    environment:
+      - NETMAP_DATA_DIR=/data
+    volumes:
+      - netmap-data:/data
+    # Extra CLI flags, e.g.:  command: ["--port", "8340", "--home", "39.74,-104.99"]
+
+volumes:
+  netmap-data:
