@@ -217,3 +217,22 @@ class EndToEnd(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TileHosts(unittest.TestCase):
+    """The page's tile URLs must be allowed by the CSP, or the map silently
+    falls back to OSM (a 'basemap' vs 'basemaps' typo once sent every view there,
+    and OSM blocked it)."""
+
+    def test_tile_hosts_allowed_by_csp(self):
+        import re
+        from netmap_core import web
+        with open(os.path.join(HERE, "..", "netmap_core", "static", "app.js")) as f:
+            js = f.read()
+        hosts = re.findall(r'L\.tileLayer\(\s*"https://([^/"]+)/', js)
+        self.assertEqual(len(hosts), 2)
+        img_src = web.CSP.split("img-src")[1].split(";")[0]
+        for h in hosts:
+            pattern = "https://" + h
+            self.assertIn(pattern, img_src, "tile host %s not allowed by the CSP" % h)
+        self.assertIn("server.arcgisonline.com", js)

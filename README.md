@@ -124,8 +124,8 @@ Tests: `python -m unittest discover -s tests -t .`
 
 ## Credits
 
-Map: [Leaflet](https://leafletjs.com/), © [OpenStreetMap](https://www.openstreetmap.org/copyright)
-contributors, © [CARTO](https://carto.com/attributions). IP geolocation by
+Map: [Leaflet](https://leafletjs.com/), tiles © [Esri](https://www.esri.com) (World Dark Gray),
+fallback © [OpenStreetMap](https://www.openstreetmap.org/copyright) contributors. IP geolocation by
 [DB-IP](https://db-ip.com) (CC BY 4.0) and [ip-api.com](https://ip-api.com).
 Blocklists by [abuse.ch](https://abuse.ch), [Spamhaus](https://www.spamhaus.org),
 [FireHOL](https://iplists.firehol.org), [blocklist.de](https://www.blocklist.de),

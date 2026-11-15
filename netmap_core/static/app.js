@@ -116,22 +116,27 @@ if(HAS_MAP){
   map = L.map("map", {worldCopyJump:true, zoomControl:true, minZoom:2}).setView([25, 0], 2);
   const osmAttr = '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>';
   let tileOK = false, tileErrs = 0, fellBack = false;
-  const carto = L.tileLayer("https://{s}.basemap.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png", {
-    attribution: osmAttr + ' &copy; <a href="https://carto.com/attributions">CARTO</a>',
-    subdomains:"abcd", maxZoom:19}).addTo(map);
+  // Primary: Esri World Dark Gray (free, no API key; CARTO now needs one).
+  // Fallback: OpenStreetMap with a CSS dark filter. Both need a Referer, which
+  // the server's Referrer-Policy sends (origin only).
+  const base = L.tileLayer(
+    "https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}", {
+    attribution: 'Tiles &copy; <a href="https://www.esri.com">Esri</a> &mdash; Esri, HERE, Garmin, &copy; OpenStreetMap contributors',
+    maxZoom:16, referrerPolicy:"strict-origin-when-cross-origin"}).addTo(map);
   const fallback = () => {
     if(fellBack) return;
     fellBack = true;
-    map.removeLayer(carto);
+    map.removeLayer(base);
     const osm = L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png",
-      {attribution: osmAttr, maxZoom:19, className:"osm-dark"});
+      {attribution: osmAttr, maxZoom:19, className:"osm-dark",
+       referrerPolicy:"strict-origin-when-cross-origin"});   // OSM tile policy needs a Referer
     let ok = false;
     osm.on("tileload", () => { ok = true; });
     osm.on("tileerror", () => { if(!ok) tileBanner = "Map tiles are unreachable; connections still plot."; });
     osm.addTo(map);
   };
-  carto.on("tileload", () => { tileOK = true; });
-  carto.on("tileerror", () => { if(!tileOK && ++tileErrs >= 3) fallback(); });
+  base.on("tileload", () => { tileOK = true; });
+  base.on("tileerror", () => { if(!tileOK && ++tileErrs >= 3) fallback(); });
   setTimeout(() => { if(!tileOK) fallback(); }, 8000);
 } else {
   $("map").innerHTML = '<div class="empty">Map library could not load (cdnjs.cloudflare.com). '

@@ -33,7 +33,7 @@ COOKIE = "netmap_session"
 MAX_BODY = 256 * 1024
 CSP = ("default-src 'self'; script-src 'self' https://cdnjs.cloudflare.com; "
        "style-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com; "
-       "img-src 'self' data: https://*.basemap.cartocdn.com https://tile.openstreetmap.org; "
+       "img-src 'self' data: https://server.arcgisonline.com https://tile.openstreetmap.org; "
        "connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
 _COLOR = re.compile(r"^#[0-9a-fA-F]{6}$")
 _HOST = re.compile(r"^[A-Za-z0-9.:\-\[\]]{1,253}$")
@@ -394,7 +394,9 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "DENY")
-        self.send_header("Referrer-Policy", "no-referrer")
+        # Map tile servers (Esri, OpenStreetMap usage policy) require a Referer.
+        # Send only the origin cross-site - never page paths or query strings.
+        self.send_header("Referrer-Policy", "strict-origin-when-cross-origin")
         self.send_header("Content-Security-Policy", CSP)
         for k, v in (extra or []):
             self.send_header(k, v)
